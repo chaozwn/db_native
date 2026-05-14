@@ -25,6 +25,7 @@ async fn clickhouse_connects_and_queries() {
         .query(
             "SELECT 1 AS ping, currentDatabase() AS database_name".to_string(),
             None,
+            None,
         )
         .await
         .expect("simple clickhouse query should succeed");
@@ -48,6 +49,7 @@ async fn clickhouse_connects_and_queries() {
             "SELECT name FROM system.tables WHERE database = currentDatabase() ORDER BY name LIMIT 5"
                 .to_string(),
             None,
+            None,
         )
         .await
         .expect("table listing query should succeed");
@@ -61,6 +63,7 @@ async fn clickhouse_connects_and_queries() {
         .query(
             "SELECT number AS n FROM numbers(3) ORDER BY n".to_string(),
             Some(2),
+            None,
         )
         .await
         .expect("limited clickhouse query should succeed");

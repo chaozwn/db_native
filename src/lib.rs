@@ -1,12 +1,14 @@
 mod drivers;
 mod error;
 mod save;
+mod session;
 
 pub use drivers::{
     ClickHouseDriver, DorisDriver, DuckDbDriver, MysqlDriver, PostgresDriver, StarRocksDriver,
     SupabaseDriver,
 };
 pub use save::SaveResult;
+pub use session::SessionInfo;
 
 use napi_derive::napi;
 

@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,12 +15,28 @@ fn temp_csv_path() -> PathBuf {
     env::temp_dir().join(format!("db_native_duckdb_smoke_{suffix}.csv"))
 }
 
+fn cleanup_session(session_path: &Path) {
+    if let Some(session_dir) = session_path.parent() {
+        let _ = fs::remove_dir_all(session_dir);
+    }
+}
+
 #[test]
 fn duckdb_queries_memory_and_csv() {
     let driver = DuckDbDriver::new();
+    let session_path = PathBuf::from(
+        driver
+            .get_session()
+            .expect("session info should be available")
+            .path,
+    );
 
     let ping = driver
-        .query("SELECT 1 AS ping, 'duckdb' AS engine".to_string(), None)
+        .query(
+            "SELECT 1 AS ping, 'duckdb' AS engine".to_string(),
+            None,
+            None,
+        )
         .expect("simple duckdb query should succeed");
 
     assert_eq!(ping.rows.len(), 1, "expected one row from ping query");
@@ -46,7 +62,7 @@ fn duckdb_queries_memory_and_csv() {
         format!("SELECT id, name, score FROM read_csv_auto('{escaped_path}') ORDER BY id");
 
     let csv_result = driver
-        .query(csv_query, None)
+        .query(csv_query, None, None)
         .expect("duckdb csv query should succeed");
 
     assert_eq!(csv_result.rows.len(), 2, "expected two rows from csv query");
@@ -74,6 +90,7 @@ fn duckdb_queries_memory_and_csv() {
         .query(
             "SELECT * FROM (VALUES (1), (2), (3)) AS t(id) ORDER BY id".to_string(),
             Some(2),
+            None,
         )
         .expect("limited duckdb query should succeed");
 
@@ -82,4 +99,59 @@ fn duckdb_queries_memory_and_csv() {
     fs::remove_file(&csv_path).expect("csv fixture should be removed");
 
     driver.close().expect("duckdb close should succeed");
+    cleanup_session(&session_path);
+}
+
+#[test]
+fn duckdb_records_session_views() {
+    let driver = DuckDbDriver::new();
+    let session = driver
+        .get_session()
+        .expect("session info should be available");
+    let session_path = PathBuf::from(&session.path);
+
+    assert!(
+        session_path.exists(),
+        "session file should be created when the driver is initialized",
+    );
+
+    let result = driver
+        .query(
+            "SELECT 42 AS answer".to_string(),
+            None,
+            Some("step_1".to_string()),
+        )
+        .expect("tracked query should succeed");
+
+    assert_eq!(result.rows.len(), 1);
+
+    let error = driver.query(
+        "SELECT * FROM definitely_missing_table".to_string(),
+        None,
+        Some("step_error".to_string()),
+    );
+    assert!(error.is_err(), "failing query should return an error");
+
+    let session_json = fs::read_to_string(&session_path).expect("session file should be readable");
+    let document: serde_json::Value =
+        serde_json::from_str(&session_json).expect("session file should be valid JSON");
+    let views = document["views"]
+        .as_array()
+        .expect("session views should be an array");
+
+    assert_eq!(
+        document["session_id"].as_str(),
+        Some(session.session_id.as_str())
+    );
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0]["view_name"].as_str(), Some("step_1"));
+    assert_eq!(views[0]["operation"].as_str(), Some("query"));
+    assert_eq!(views[0]["row_count"].as_i64(), Some(1));
+    assert_eq!(views[0]["status"].as_str(), Some("success"));
+    assert_eq!(views[1]["view_name"].as_str(), Some("step_error"));
+    assert_eq!(views[1]["status"].as_str(), Some("error"));
+    assert!(views[1]["error"].as_str().is_some());
+
+    driver.close().expect("duckdb close should succeed");
+    cleanup_session(&session_path);
 }

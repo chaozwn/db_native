@@ -25,6 +25,7 @@ async fn doris_connects_and_queries() {
         .query(
             "SELECT 1 AS ping, DATABASE() AS database_name".to_string(),
             None,
+            None,
         )
         .await
         .expect("simple doris query should succeed");
@@ -44,7 +45,7 @@ async fn doris_connects_and_queries() {
     );
 
     let tables = driver
-        .query("SHOW TABLES".to_string(), None)
+        .query("SHOW TABLES".to_string(), None, None)
         .await
         .expect("SHOW TABLES should succeed");
 
@@ -57,6 +58,7 @@ async fn doris_connects_and_queries() {
         .query(
             "SELECT 1 AS n UNION ALL SELECT 2 AS n UNION ALL SELECT 3 AS n".to_string(),
             Some(2),
+            None,
         )
         .await
         .expect("limited doris query should succeed");

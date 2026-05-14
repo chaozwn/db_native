@@ -7,16 +7,19 @@ use serde_json::{Map, Value};
 use tokio::{io::AsyncBufReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::SessionInfo;
 use crate::{
     error::{into_napi_error, state_error, DbNativeResult},
     resolve_query_limit, resolve_stream_batch_size,
     save::{spawn_streaming_save_worker, SaveResult},
+    session::SessionRecorder,
     ColumnMeta, QueryBatch, QueryResult,
 };
 
 #[napi]
 pub struct ClickHouseDriver {
     client: Mutex<Option<Client>>,
+    session: SessionRecorder,
 }
 
 #[napi]
@@ -41,13 +44,37 @@ impl ClickHouseDriver {
 
         Ok(ClickHouseDriver {
             client: Mutex::new(Some(client)),
+            session: SessionRecorder::new()?,
         })
     }
 
     #[napi]
-    pub async fn query(&self, sql: String, limit: Option<u32>) -> DbNativeResult<QueryResult> {
-        self.query_internal(sql, Some(resolve_query_limit(limit)))
-            .await
+    pub async fn query(
+        &self,
+        sql: String,
+        limit: Option<u32>,
+        view_name: Option<String>,
+    ) -> DbNativeResult<QueryResult> {
+        let result = self
+            .query_internal(sql.clone(), Some(resolve_query_limit(limit)))
+            .await;
+        match result {
+            Ok(result) => {
+                self.session.record_success(
+                    view_name,
+                    "query",
+                    &sql,
+                    Some(result.rows.len() as i64),
+                )?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "query", &sql, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     #[napi(js_name = "queryStream")]
@@ -57,18 +84,38 @@ impl ClickHouseDriver {
         sql: String,
         batch_size: Option<u32>,
         limit: Option<u32>,
+        view_name: Option<String>,
     ) -> DbNativeResult<ReadableStream<'static, QueryBatch>> {
         let client = self.client()?;
+        let session = self.session.clone();
         let batch_size = resolve_stream_batch_size(batch_size);
         let limit = resolve_query_limit(limit);
         let (sender, receiver) = mpsc::channel::<DbNativeResult<QueryBatch>>(2);
 
         tokio::spawn(async move {
-            if let Err(error) =
-                stream_clickhouse_query_to_channel(client, sql, batch_size, limit, sender.clone())
-                    .await
+            let record_sql = sql.clone();
+            match stream_clickhouse_query_to_channel(client, sql, batch_size, limit, sender.clone())
+                .await
             {
-                let _ = sender.send(Err(error)).await;
+                Ok(row_count) => {
+                    if let Err(error) = session.record_success(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        Some(row_count as i64),
+                    ) {
+                        let _ = sender.send(Err(error)).await;
+                    }
+                }
+                Err(error) => {
+                    let _ = session.record_error(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        error.to_string(),
+                    );
+                    let _ = sender.send(Err(error)).await;
+                }
             }
         });
 
@@ -85,6 +132,11 @@ impl ClickHouseDriver {
         Ok(())
     }
 
+    #[napi(js_name = "getSession")]
+    pub fn get_session(&self) -> DbNativeResult<SessionInfo> {
+        self.session.info()
+    }
+
     #[napi]
     pub async fn save(
         &self,
@@ -92,20 +144,22 @@ impl ClickHouseDriver {
         file_type: String,
         path: String,
         mode: Option<String>,
+        view_name: Option<String>,
     ) -> DbNativeResult<SaveResult> {
-        let client = self.client()?;
-        let batch_size = resolve_stream_batch_size(None);
-        let (sender, result_receiver) = spawn_streaming_save_worker(file_type, path, mode);
-        if let Err(error) =
-            stream_clickhouse_query_to_channel(client, sql, batch_size, usize::MAX, sender.clone())
-                .await
-        {
-            let _ = sender.send(Err(error)).await;
+        let result = self.save_internal(sql.clone(), file_type, path, mode).await;
+        match result {
+            Ok(result) => {
+                self.session
+                    .record_success(view_name, "save", &sql, Some(result.row_count))?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "save", &sql, error.to_string());
+                Err(error)
+            }
         }
-        drop(sender);
-        result_receiver
-            .await
-            .map_err(|_| state_error("ClickHouse streaming save worker was cancelled"))?
     }
 }
 
@@ -115,7 +169,7 @@ async fn stream_clickhouse_query_to_channel(
     batch_size: usize,
     limit: usize,
     sender: mpsc::Sender<DbNativeResult<QueryBatch>>,
-) -> DbNativeResult<()> {
+) -> DbNativeResult<usize> {
     let mut lines = client
         .query(sql.as_str())
         .fetch_bytes("JSONCompactEachRowWithNamesAndTypes")
@@ -162,7 +216,7 @@ async fn stream_clickhouse_query_to_channel(
             };
             emitted = true;
             if sender.send(Ok(batch)).await.is_err() {
-                return Ok(());
+                return Ok(sent_rows);
             }
         }
     }
@@ -173,7 +227,7 @@ async fn stream_clickhouse_query_to_channel(
         let _ = sender.send(Ok(batch)).await;
     }
 
-    Ok(())
+    Ok(sent_rows)
 }
 
 impl ClickHouseDriver {
@@ -186,6 +240,28 @@ impl ClickHouseDriver {
             .as_ref()
             .cloned()
             .ok_or_else(|| state_error("ClickHouse connection is already closed"))
+    }
+
+    async fn save_internal(
+        &self,
+        sql: String,
+        file_type: String,
+        path: String,
+        mode: Option<String>,
+    ) -> DbNativeResult<SaveResult> {
+        let client = self.client()?;
+        let batch_size = resolve_stream_batch_size(None);
+        let (sender, result_receiver) = spawn_streaming_save_worker(file_type, path, mode);
+        if let Err(error) =
+            stream_clickhouse_query_to_channel(client, sql, batch_size, usize::MAX, sender.clone())
+                .await
+        {
+            let _ = sender.send(Err(error)).await;
+        }
+        drop(sender);
+        result_receiver
+            .await
+            .map_err(|_| state_error("ClickHouse streaming save worker was cancelled"))?
     }
 
     async fn query_internal(

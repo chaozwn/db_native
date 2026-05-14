@@ -15,16 +15,19 @@ use sqlx::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::SessionInfo;
 use crate::{
     error::{into_napi_error, state_error, DbNativeResult},
     resolve_query_limit, resolve_stream_batch_size,
     save::{spawn_streaming_save_worker, SaveResult},
+    session::SessionRecorder,
     ColumnMeta, QueryBatch, QueryResult,
 };
 
 struct MySqlProtocolDriver {
     pool: Mutex<Option<MySqlPool>>,
     driver_label: &'static str,
+    session: SessionRecorder,
 }
 
 impl MySqlProtocolDriver {
@@ -53,12 +56,36 @@ impl MySqlProtocolDriver {
         Ok(Self {
             pool: Mutex::new(Some(pool)),
             driver_label,
+            session: SessionRecorder::new()?,
         })
     }
 
-    async fn query(&self, sql: String, limit: Option<u32>) -> DbNativeResult<QueryResult> {
-        self.query_internal(sql, Some(resolve_query_limit(limit)))
-            .await
+    async fn query(
+        &self,
+        sql: String,
+        limit: Option<u32>,
+        view_name: Option<String>,
+    ) -> DbNativeResult<QueryResult> {
+        let result = self
+            .query_internal(sql.clone(), Some(resolve_query_limit(limit)))
+            .await;
+        match result {
+            Ok(result) => {
+                self.session.record_success(
+                    view_name,
+                    "query",
+                    &sql,
+                    Some(result.rows.len() as i64),
+                )?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "query", &sql, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     fn query_stream(
@@ -67,17 +94,37 @@ impl MySqlProtocolDriver {
         sql: String,
         batch_size: Option<u32>,
         limit: Option<u32>,
+        view_name: Option<String>,
     ) -> DbNativeResult<ReadableStream<'static, QueryBatch>> {
         let pool = self.pool()?;
+        let session = self.session.clone();
         let batch_size = resolve_stream_batch_size(batch_size);
         let limit = resolve_query_limit(limit);
         let (sender, receiver) = mpsc::channel::<DbNativeResult<QueryBatch>>(2);
 
         tokio::spawn(async move {
-            if let Err(error) =
-                stream_mysql_query_to_channel(pool, sql, batch_size, limit, sender.clone()).await
+            let record_sql = sql.clone();
+            match stream_mysql_query_to_channel(pool, sql, batch_size, limit, sender.clone()).await
             {
-                let _ = sender.send(Err(error)).await;
+                Ok(row_count) => {
+                    if let Err(error) = session.record_success(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        Some(row_count as i64),
+                    ) {
+                        let _ = sender.send(Err(error)).await;
+                    }
+                }
+                Err(error) => {
+                    let _ = session.record_error(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        error.to_string(),
+                    );
+                    let _ = sender.send(Err(error)).await;
+                }
             }
         });
 
@@ -100,6 +147,34 @@ impl MySqlProtocolDriver {
     }
 
     async fn save(
+        &self,
+        sql: String,
+        file_type: String,
+        path: String,
+        mode: Option<String>,
+        view_name: Option<String>,
+    ) -> DbNativeResult<SaveResult> {
+        let result = self.save_internal(sql.clone(), file_type, path, mode).await;
+        match result {
+            Ok(result) => {
+                self.session
+                    .record_success(view_name, "save", &sql, Some(result.row_count))?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "save", &sql, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    fn get_session(&self) -> DbNativeResult<SessionInfo> {
+        self.session.info()
+    }
+
+    async fn save_internal(
         &self,
         sql: String,
         file_type: String,
@@ -182,7 +257,7 @@ async fn stream_mysql_query_to_channel(
     batch_size: usize,
     limit: usize,
     sender: mpsc::Sender<DbNativeResult<QueryBatch>>,
-) -> DbNativeResult<()> {
+) -> DbNativeResult<usize> {
     let describe = pool.describe(sql.as_str()).await.ok();
     let mut columns = describe.map(columns_from_describe);
     let mut stream = sqlx::query(sql.as_str()).fetch(&pool);
@@ -209,7 +284,7 @@ async fn stream_mysql_query_to_channel(
             };
             emitted = true;
             if sender.send(Ok(batch)).await.is_err() {
-                return Ok(());
+                return Ok(sent_rows);
             }
         }
     }
@@ -220,7 +295,7 @@ async fn stream_mysql_query_to_channel(
         let _ = sender.send(Ok(batch)).await;
     }
 
-    Ok(())
+    Ok(sent_rows)
 }
 
 fn columns_from_describe(metadata: sqlx::Describe<sqlx::MySql>) -> Vec<ColumnMeta> {
@@ -264,8 +339,9 @@ macro_rules! define_mysql_protocol_driver {
                 &self,
                 sql: String,
                 limit: Option<u32>,
+                view_name: Option<String>,
             ) -> DbNativeResult<QueryResult> {
-                self.inner.query(sql, limit).await
+                self.inner.query(sql, limit, view_name).await
             }
 
             #[napi(js_name = "queryStream")]
@@ -275,8 +351,10 @@ macro_rules! define_mysql_protocol_driver {
                 sql: String,
                 batch_size: Option<u32>,
                 limit: Option<u32>,
+                view_name: Option<String>,
             ) -> DbNativeResult<ReadableStream<'static, QueryBatch>> {
-                self.inner.query_stream(env, sql, batch_size, limit)
+                self.inner
+                    .query_stream(env, sql, batch_size, limit, view_name)
             }
 
             #[napi]
@@ -291,8 +369,14 @@ macro_rules! define_mysql_protocol_driver {
                 file_type: String,
                 path: String,
                 mode: Option<String>,
+                view_name: Option<String>,
             ) -> DbNativeResult<SaveResult> {
-                self.inner.save(sql, file_type, path, mode).await
+                self.inner.save(sql, file_type, path, mode, view_name).await
+            }
+
+            #[napi(js_name = "getSession")]
+            pub fn get_session(&self) -> DbNativeResult<SessionInfo> {
+                self.inner.get_session()
             }
         }
     };

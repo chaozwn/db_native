@@ -13,16 +13,19 @@ use serde_json::{Map, Number, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::SessionInfo;
 use crate::{
     error::{into_napi_error, state_error, DbNativeResult},
     resolve_query_limit, resolve_stream_batch_size,
     save::{SaveResult, StreamingSaveWriter},
+    session::SessionRecorder,
     ColumnMeta, QueryBatch, QueryResult,
 };
 
 #[napi]
 pub struct DuckDbDriver {
     connection: Arc<Mutex<Option<Connection>>>,
+    session: SessionRecorder,
 }
 
 #[napi]
@@ -37,12 +40,36 @@ impl DuckDbDriver {
 
         Self {
             connection: Arc::new(Mutex::new(Some(connection))),
+            session: SessionRecorder::new()
+                .unwrap_or_else(|error| panic!("Failed to initialize session: {error}")),
         }
     }
 
     #[napi]
-    pub fn query(&self, sql: String, limit: Option<u32>) -> DbNativeResult<QueryResult> {
-        self.query_internal(sql, Some(resolve_query_limit(limit)))
+    pub fn query(
+        &self,
+        sql: String,
+        limit: Option<u32>,
+        view_name: Option<String>,
+    ) -> DbNativeResult<QueryResult> {
+        let result = self.query_internal(sql.clone(), Some(resolve_query_limit(limit)));
+        match result {
+            Ok(result) => {
+                self.session.record_success(
+                    view_name,
+                    "query",
+                    &sql,
+                    Some(result.rows.len() as i64),
+                )?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "query", &sql, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     #[napi(js_name = "queryStream")]
@@ -52,17 +79,37 @@ impl DuckDbDriver {
         sql: String,
         batch_size: Option<u32>,
         limit: Option<u32>,
+        view_name: Option<String>,
     ) -> DbNativeResult<ReadableStream<'static, QueryBatch>> {
         let connection = Arc::clone(&self.connection);
+        let session = self.session.clone();
         let batch_size = resolve_stream_batch_size(batch_size);
         let limit = resolve_query_limit(limit);
         let (sender, receiver) = mpsc::channel::<DbNativeResult<QueryBatch>>(2);
 
         std::thread::spawn(move || {
-            if let Err(error) =
-                stream_duckdb_query_to_channel(connection, sql, batch_size, limit, sender.clone())
+            let record_sql = sql.clone();
+            match stream_duckdb_query_to_channel(connection, sql, batch_size, limit, sender.clone())
             {
-                let _ = sender.blocking_send(Err(error));
+                Ok(row_count) => {
+                    if let Err(error) = session.record_success(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        Some(row_count as i64),
+                    ) {
+                        let _ = sender.blocking_send(Err(error));
+                    }
+                }
+                Err(error) => {
+                    let _ = session.record_error(
+                        view_name,
+                        "queryStream",
+                        &record_sql,
+                        error.to_string(),
+                    );
+                    let _ = sender.blocking_send(Err(error));
+                }
             }
         });
 
@@ -116,8 +163,107 @@ impl DuckDbDriver {
         Ok(())
     }
 
+    #[napi(js_name = "getSession")]
+    pub fn get_session(&self) -> DbNativeResult<SessionInfo> {
+        self.session.info()
+    }
+
     #[napi]
     pub fn save(
+        &self,
+        sql: String,
+        file_type: String,
+        path: String,
+        mode: Option<String>,
+        view_name: Option<String>,
+    ) -> DbNativeResult<SaveResult> {
+        let result = self.save_internal(sql.clone(), file_type, path, mode);
+        match result {
+            Ok(result) => {
+                self.session
+                    .record_success(view_name, "save", &sql, Some(result.row_count))?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = self
+                    .session
+                    .record_error(view_name, "save", &sql, error.to_string());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn stream_duckdb_query_to_channel(
+    connection: Arc<Mutex<Option<Connection>>>,
+    sql: String,
+    batch_size: usize,
+    limit: usize,
+    sender: mpsc::Sender<DbNativeResult<QueryBatch>>,
+) -> DbNativeResult<usize> {
+    let guard = connection
+        .lock()
+        .map_err(|_| state_error("DuckDB connection lock is poisoned"))?;
+    let connection = guard
+        .as_ref()
+        .ok_or_else(|| state_error("DuckDB connection is already closed"))?;
+    let mut statement = connection.prepare(sql.as_str()).map_err(into_napi_error)?;
+    let mut rows = statement.query([]).map_err(into_napi_error)?;
+    let statement_ref = rows
+        .as_ref()
+        .ok_or_else(|| state_error("DuckDB statement metadata is unavailable"))?;
+    let columns = (0..statement_ref.column_count())
+        .map(|index| ColumnMeta {
+            name: statement_ref
+                .column_name(index)
+                .map(|name| name.to_string())
+                .unwrap_or_else(|_| format!("column_{index}")),
+            data_type: format!("{:?}", statement_ref.column_type(index)),
+        })
+        .collect::<Vec<_>>();
+    let mut result_rows = Vec::with_capacity(batch_size);
+    let mut emitted = false;
+    let mut sent_rows = 0usize;
+
+    while sent_rows < limit {
+        let Some(row) = rows.next().map_err(into_napi_error)? else {
+            break;
+        };
+        let mut object = Map::with_capacity(columns.len());
+
+        for (index, column) in columns.iter().enumerate() {
+            let value = row.get_ref(index).map_err(into_napi_error)?;
+            object.insert(column.name.clone(), value_ref_to_json(value));
+        }
+
+        result_rows.push(Value::Object(object));
+        sent_rows += 1;
+
+        if result_rows.len() >= batch_size {
+            let batch = QueryBatch {
+                columns: columns.clone(),
+                rows: std::mem::take(&mut result_rows),
+            };
+            emitted = true;
+            if sender.blocking_send(Ok(batch)).is_err() {
+                return Ok(sent_rows);
+            }
+        }
+    }
+
+    if !result_rows.is_empty() || (!emitted && !columns.is_empty()) {
+        let batch = QueryBatch {
+            columns,
+            rows: result_rows,
+        };
+        let _ = sender.blocking_send(Ok(batch));
+    }
+
+    Ok(sent_rows)
+}
+
+impl DuckDbDriver {
+    fn save_internal(
         &self,
         sql: String,
         file_type: String,
@@ -171,77 +317,7 @@ impl DuckDbDriver {
         writer.write_batch(&columns, &result_rows)?;
         writer.finish()
     }
-}
 
-fn stream_duckdb_query_to_channel(
-    connection: Arc<Mutex<Option<Connection>>>,
-    sql: String,
-    batch_size: usize,
-    limit: usize,
-    sender: mpsc::Sender<DbNativeResult<QueryBatch>>,
-) -> DbNativeResult<()> {
-    let guard = connection
-        .lock()
-        .map_err(|_| state_error("DuckDB connection lock is poisoned"))?;
-    let connection = guard
-        .as_ref()
-        .ok_or_else(|| state_error("DuckDB connection is already closed"))?;
-    let mut statement = connection.prepare(sql.as_str()).map_err(into_napi_error)?;
-    let mut rows = statement.query([]).map_err(into_napi_error)?;
-    let statement_ref = rows
-        .as_ref()
-        .ok_or_else(|| state_error("DuckDB statement metadata is unavailable"))?;
-    let columns = (0..statement_ref.column_count())
-        .map(|index| ColumnMeta {
-            name: statement_ref
-                .column_name(index)
-                .map(|name| name.to_string())
-                .unwrap_or_else(|_| format!("column_{index}")),
-            data_type: format!("{:?}", statement_ref.column_type(index)),
-        })
-        .collect::<Vec<_>>();
-    let mut result_rows = Vec::with_capacity(batch_size);
-    let mut emitted = false;
-    let mut sent_rows = 0usize;
-
-    while sent_rows < limit {
-        let Some(row) = rows.next().map_err(into_napi_error)? else {
-            break;
-        };
-        let mut object = Map::with_capacity(columns.len());
-
-        for (index, column) in columns.iter().enumerate() {
-            let value = row.get_ref(index).map_err(into_napi_error)?;
-            object.insert(column.name.clone(), value_ref_to_json(value));
-        }
-
-        result_rows.push(Value::Object(object));
-        sent_rows += 1;
-
-        if result_rows.len() >= batch_size {
-            let batch = QueryBatch {
-                columns: columns.clone(),
-                rows: std::mem::take(&mut result_rows),
-            };
-            emitted = true;
-            if sender.blocking_send(Ok(batch)).is_err() {
-                return Ok(());
-            }
-        }
-    }
-
-    if !result_rows.is_empty() || (!emitted && !columns.is_empty()) {
-        let batch = QueryBatch {
-            columns,
-            rows: result_rows,
-        };
-        let _ = sender.blocking_send(Ok(batch));
-    }
-
-    Ok(())
-}
-
-impl DuckDbDriver {
     fn query_internal(&self, sql: String, limit: Option<usize>) -> DbNativeResult<QueryResult> {
         let started_at = Instant::now();
         let guard = self

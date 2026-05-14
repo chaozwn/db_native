@@ -34,6 +34,7 @@ async fn postgres_connects_and_queries() {
             "SELECT 1 AS ping, current_database() AS database_name, current_schema() AS schema_name"
                 .to_string(),
             None,
+            None,
         )
         .await
         .expect("simple postgres query should succeed");
@@ -61,6 +62,7 @@ async fn postgres_connects_and_queries() {
             "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() ORDER BY table_name LIMIT 5"
                 .to_string(),
             None,
+            None,
         )
         .await
         .expect("table listing query should succeed");
@@ -74,6 +76,7 @@ async fn postgres_connects_and_queries() {
         .query(
             "SELECT 1 AS n UNION ALL SELECT 2 AS n UNION ALL SELECT 3 AS n".to_string(),
             Some(2),
+            None,
         )
         .await
         .expect("limited postgres query should succeed");

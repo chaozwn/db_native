@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,9 +15,21 @@ fn temp_dir() -> PathBuf {
     env::temp_dir().join(format!("db_native_save_smoke_{suffix}"))
 }
 
+fn cleanup_session(session_path: &Path) {
+    if let Some(session_dir) = session_path.parent() {
+        let _ = fs::remove_dir_all(session_dir);
+    }
+}
+
 #[test]
 fn duckdb_save_supports_all_formats() {
     let driver = DuckDbDriver::new();
+    let session_path = PathBuf::from(
+        driver
+            .get_session()
+            .expect("session info should be available")
+            .path,
+    );
     let output_dir = temp_dir();
     fs::create_dir_all(&output_dir).expect("output directory should be created");
 
@@ -35,6 +47,7 @@ fn duckdb_save_supports_all_formats() {
             "csv".to_string(),
             csv_path.to_string_lossy().into_owned(),
             None,
+            None,
         )
         .expect("csv save should succeed");
     driver
@@ -42,6 +55,7 @@ fn duckdb_save_supports_all_formats() {
             sql.to_string(),
             "json".to_string(),
             json_path.to_string_lossy().into_owned(),
+            None,
             None,
         )
         .expect("json save should succeed");
@@ -51,6 +65,7 @@ fn duckdb_save_supports_all_formats() {
             "parquet".to_string(),
             parquet_path.to_string_lossy().into_owned(),
             None,
+            None,
         )
         .expect("parquet save should succeed");
     driver
@@ -59,6 +74,7 @@ fn duckdb_save_supports_all_formats() {
             "orc".to_string(),
             orc_path.to_string_lossy().into_owned(),
             None,
+            None,
         )
         .expect("orc save should succeed");
     driver
@@ -66,6 +82,7 @@ fn duckdb_save_supports_all_formats() {
             sql.to_string(),
             "excel".to_string(),
             excel_path.to_string_lossy().into_owned(),
+            None,
             None,
         )
         .expect("excel save should succeed");
@@ -89,12 +106,19 @@ fn duckdb_save_supports_all_formats() {
     assert_eq!(&excel[..2], b"PK");
 
     driver.close().expect("duckdb close should succeed");
+    cleanup_session(&session_path);
     fs::remove_dir_all(&output_dir).expect("output directory should be removed");
 }
 
 #[test]
 fn duckdb_save_append_supports_csv_and_json() {
     let driver = DuckDbDriver::new();
+    let session_path = PathBuf::from(
+        driver
+            .get_session()
+            .expect("session info should be available")
+            .path,
+    );
     let output_dir = temp_dir();
     fs::create_dir_all(&output_dir).expect("output directory should be created");
 
@@ -107,6 +131,7 @@ fn duckdb_save_append_supports_csv_and_json() {
             "csv".to_string(),
             csv_path.to_string_lossy().into_owned(),
             Some("overwrite".to_string()),
+            None,
         )
         .expect("csv overwrite save should succeed");
     driver
@@ -115,6 +140,7 @@ fn duckdb_save_append_supports_csv_and_json() {
             "csv".to_string(),
             csv_path.to_string_lossy().into_owned(),
             Some("append".to_string()),
+            None,
         )
         .expect("csv append save should succeed");
 
@@ -124,6 +150,7 @@ fn duckdb_save_append_supports_csv_and_json() {
             "json".to_string(),
             json_path.to_string_lossy().into_owned(),
             Some("overwrite".to_string()),
+            None,
         )
         .expect("json overwrite save should succeed");
     driver
@@ -132,6 +159,7 @@ fn duckdb_save_append_supports_csv_and_json() {
             "json".to_string(),
             json_path.to_string_lossy().into_owned(),
             Some("append".to_string()),
+            None,
         )
         .expect("json append save should succeed");
 
@@ -146,12 +174,19 @@ fn duckdb_save_append_supports_csv_and_json() {
     assert_eq!(rows.len(), 2);
 
     driver.close().expect("duckdb close should succeed");
+    cleanup_session(&session_path);
     fs::remove_dir_all(&output_dir).expect("output directory should be removed");
 }
 
 #[test]
 fn duckdb_save_append_rejects_existing_parquet() {
     let driver = DuckDbDriver::new();
+    let session_path = PathBuf::from(
+        driver
+            .get_session()
+            .expect("session info should be available")
+            .path,
+    );
     let output_dir = temp_dir();
     fs::create_dir_all(&output_dir).expect("output directory should be created");
 
@@ -163,6 +198,7 @@ fn duckdb_save_append_rejects_existing_parquet() {
             "parquet".to_string(),
             parquet_path.to_string_lossy().into_owned(),
             Some("overwrite".to_string()),
+            None,
         )
         .expect("parquet overwrite save should succeed");
 
@@ -171,6 +207,7 @@ fn duckdb_save_append_rejects_existing_parquet() {
         "parquet".to_string(),
         parquet_path.to_string_lossy().into_owned(),
         Some("append".to_string()),
+        None,
     ) {
         Ok(_) => panic!("parquet append should fail"),
         Err(error) => error,
@@ -184,5 +221,6 @@ fn duckdb_save_append_rejects_existing_parquet() {
     );
 
     driver.close().expect("duckdb close should succeed");
+    cleanup_session(&session_path);
     fs::remove_dir_all(&output_dir).expect("output directory should be removed");
 }
