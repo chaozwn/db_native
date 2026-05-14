@@ -1,0 +1,29 @@
+[package]
+name = "db-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrow_save = { package = "arrow", version = "57.0" }
+clickhouse = { version = "0.14.2", features = ["rustls-tls"] }
+csv = "1.4"
+duckdb = { version = "1.2", features = ["bundled"] }
+futures-util = "0.3"
+napi = { version = "3", features = ["async", "napi5", "serde-json", "tokio_rt", "web_stream"] }
+napi-derive = "3"
+orc-rust = { version = "0.7.1", default-features = false }
+parquet_save = { package = "parquet", version = "57.0", default-features = false, features = ["arrow"] }
+rust_xlsxwriter = { version = "0.94.0", features = ["constant_memory"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "mysql", "postgres", "chrono", "json", "uuid", "bigdecimal", "rust_decimal"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+napi-build = "2"

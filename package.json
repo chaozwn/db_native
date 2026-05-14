@@ -1,0 +1,36 @@
+{
+  "name": "@infini/db-native",
+  "version": "0.1.0",
+  "description": "Native database access layer for Infini Synapse",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "npm",
+    "*.node"
+  ],
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "artifacts": "napi artifacts",
+    "format": "cargo fmt --manifest-path Cargo.toml"
+  },
+  "napi": {
+    "name": "db-native",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  }
+}
